@@ -62,5 +62,3 @@ return res.status(201).json(
 
 })
  
-
-export {registerUser} 

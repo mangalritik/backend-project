@@ -84,7 +84,6 @@ userSchema.methods.generateRefreshToken = function () {
         {
             _id: this._id,
 
-
         },
         process.env.REFERESH_TOKEN_SECRET,
         {
