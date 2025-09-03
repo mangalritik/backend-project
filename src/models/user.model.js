@@ -10,7 +10,7 @@ const userSchema = new Schema(
             trim: true,
             lowecase: true,
             index: true
-        },
+        },                         
         email: {
             type: String,
             required: true,
@@ -22,7 +22,6 @@ const userSchema = new Schema(
             type: String,
             required: true,
             trim: true,
-
             index: true
         },
         avatar: {
@@ -65,7 +64,7 @@ userSchema.methods.isPasswordCorrect = async function (password) {
 }
 
 userSchema.methods.generateAccessToken = function () {
-    jwt.sign(
+  return  jwt.sign(
         {
             _id: this._id,
             email: this.email,
@@ -80,7 +79,7 @@ userSchema.methods.generateAccessToken = function () {
     )
 }
 userSchema.methods.generateRefreshToken = function () {
-    jwt.sign(
+ return  jwt.sign(
         {
             _id: this._id,
 
@@ -92,7 +91,7 @@ userSchema.methods.generateRefreshToken = function () {
     )
 }
 
- const User = mongoose.model('User', userSchema);
+const User = mongoose.model('User', userSchema);
 
 
- export { User }
+export { User }
