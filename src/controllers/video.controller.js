@@ -1,57 +1,70 @@
+
+import { handleVideoView } from "../services/view.service.js";
 import { uploadOnCloudinary } from "../utils/cloudinary.js";
 import { getVideoDuration } from "../utils/getVideoDuration.js";
 import { Video } from "../models/video.model.js";
 import { ApiError } from "../utils/ApiError.js";
 import { asyncHandler } from "../utils/asyncHandler.js";
+import { Likes } from "../models/likes.model.js";
+import { User } from "../models/user.model.js";
+import { Report } from "../models/Report.model.js";
+
+
+
+
 
 
 const uploadVideo = asyncHandler(async (req, res) => {
-    const localPath = req.files?.video?.[0]?.path;
-    if (!localPath) throw new ApiError(400, "Video file is missing");
+  console.log("REQ BODY:", req.body);
+  console.log("REQ FILES:", req.files);
 
-    // Extract duration
-    const duration = await getVideoDuration(localPath);
-    if (!duration) throw new ApiError(500, "Unable to extract video duration");
+  // Check video file
+  const localPath = req.files?.video?.[0]?.path;
+  if (!localPath) throw new ApiError(400, "Video file is missing");
 
-    // Upload to Cloudinary
-    const videoCloud = await uploadOnCloudinary(localPath);
-    if (!videoCloud?.secure_url) throw new ApiError(500, "Video upload failed");
+  // Extract duration
+  const duration = await getVideoDuration(localPath);
+  if (!duration) throw new ApiError(500, "Unable to extract video duration");
 
-    // Get data from body
-    let { title, description } = req.body;
-    let thumbnail = req.body.thumbnail; 
+  // Upload video to Cloudinary
+  const videoCloud = await uploadOnCloudinary(localPath);
+  if (!videoCloud?.secure_url) throw new ApiError(500, "Video upload failed");
 
-    if (req.files?.thumbnail?.[0]?.path) {
-        const thumbnailLocalPath = req.files.thumbnail[0].path;
-        const thumbnailCloud = await uploadOnCloudinary(thumbnailLocalPath);
-        if (!thumbnailCloud?.secure_url) {
-            throw new ApiError(500, "Thumbnail upload failed");
-        }
-        thumbnail = thumbnailCloud.secure_url;
+  // Get title & description from body (form-data)
+  const { title, description } = req.body;
+
+  // Thumbnail upload
+  let thumbnail;
+  if (req.files?.thumbnail?.[0]?.path) {
+    const thumbnailLocalPath = req.files.thumbnail[0].path;
+    const thumbnailCloud = await uploadOnCloudinary(thumbnailLocalPath);
+    if (!thumbnailCloud?.secure_url) {
+      throw new ApiError(500, "Thumbnail upload failed");
     }
+    thumbnail = thumbnailCloud.secure_url;
+  }
 
+  // Validate required fields
+  if (!title || !description || !thumbnail) {
+    throw new ApiError(400, "Title, description, and thumbnail are required");
+  }
 
-    if (!title || !description || !thumbnail) {
-        throw new ApiError(400, "Title, description, and thumbnail URL are required");
-    }
+  // Save to DB
+  const video = await Video.create({
+    video: videoCloud.secure_url,
+    thumbnail,
+    title,
+    description,
+    duration,
+    owner: req.user._id // make sure req.user is set by auth middleware
+  });
 
-    // Save to DB
-    const video = await Video.create({
-        video:videoCloud.secure_url ,
-        thumbnail,
-        title,
-        description,
-        duration,
-        owner: req.user._id
-    });
-
-    res.status(201).json({
-        success: true,
-        message: "Video uploaded successfully",
-        data: video
-    });
+  res.status(201).json({
+    success: true,
+    message: "Video uploaded successfully",
+    data: video
+  });
 });
-
 
 
 const getVideoById = asyncHandler(async (req, res) => {
@@ -317,10 +330,6 @@ const getTrendingVideos = asyncHandler(async (req, res) => {
 
 
 
-
-// controllers/video.controller.js
-import { handleVideoView } from "../services/view.service.js";
-
 const incrementVideoViews = async (req, res) => {
     try {
         const videoId = req.query.videoId; // URL से video id
@@ -433,6 +442,335 @@ const searchVideos = async (req, res) => {
 
 
 
+
+
+const toggleLikeOnVideo = async (req, res) => {
+    try {
+        const { videoId } = req.params;
+        const userId = req.user._id;
+
+        // 1. Check video existence
+        const video = await Video.findById(videoId);
+        if (!video) {
+            return res.status(404).json({
+                success: false,
+                message: "Video not found"
+            });
+        }
+
+        // 2. Check if already liked
+        const existingLike = await Like.findOne({ video: videoId, user: userId });
+
+        if (existingLike) {
+            // 👉 Unlike
+            await Like.deleteOne({ _id: existingLike._id });
+
+            const totalLikes = await Like.countDocuments({ video: videoId });
+            return res.status(200).json({
+                success: true,
+                message: "Video unliked successfully",
+                liked: false,
+                totalLikes
+            });
+        } else {
+            // 👉 Like
+            await Like.create({ video: videoId, user: userId });
+
+            const totalLikes = await Like.countDocuments({ video: videoId });
+            return res.status(200).json({
+                success: true,
+                message: "Video liked successfully",
+                liked: true,
+                totalLikes
+            });
+        }
+
+    } catch (error) {
+        console.error("Error toggling like on video:", error);
+        return res.status(500).json({
+            success: false,
+            message: "Internal server error",
+            error: error.message
+        });
+    }
+};
+
+
+
+
+
+
+
+const toggleDislikeOnVideo = async (req, res) => {
+    try {
+        const { videoId } = req.params;
+        const userId = req.user._id;
+
+        // 1. Check if video exists
+        const video = await Video.findById(videoId);
+        if (!video) {
+            return res.status(404).json({
+                success: false,
+                message: "Video not found",
+            });
+        }
+
+        // 2. Check if user already disliked
+        const existingDislike = await Likes.findOne({
+            video: videoId,
+            user: userId,
+            type: "dislike",
+        });
+
+        if (existingDislike) {
+            // 👉 Remove Dislike (toggle off)
+            await Likes.deleteOne({ _id: existingDislike._id });
+
+            const totalLikes = await Likes.countDocuments({ video: videoId, type: "like" });
+            const totalDislikes = await Likes.countDocuments({ video: videoId, type: "dislike" });
+
+            return res.status(200).json({
+                success: true,
+                message: "Dislike removed successfully",
+                disliked: false,
+                totalLikes,
+                totalDislikes,
+            });
+        }
+
+        // 3. Remove like if exists (user can't like & dislike same video simultaneously)
+        await Likes.deleteOne({ video: videoId, user: userId, type: "like" });
+
+        // 4. Add new dislike
+        await Likes.create({ video: videoId, user: userId, type: "dislike" });
+
+        const totalLikes = await Likes.countDocuments({ video: videoId, type: "like" });
+        const totalDislikes = await Likes.countDocuments({ video: videoId, type: "dislike" });
+
+        return res.status(200).json({
+            success: true,
+            message: "Video disliked successfully",
+            disliked: true,
+            totalLikes,
+            totalDislikes,
+        });
+
+    } catch (error) {
+        console.error("Error toggling dislike on video:", error);
+        return res.status(500).json({
+            success: false,
+            message: "Internal server error",
+            error: error.message,
+        });
+    }
+};
+
+
+
+
+
+
+
+const getRelatedVideos = async (req, res) => {
+  try {
+    const { videoId } = req.params;
+    const userId = req.user?._id; // optional, if user is logged in
+    const { page = 1, limit = 10 } = req.query;
+
+    // 1. Check if video exists
+    const video = await Video.findById(videoId);
+    if (!video) {
+      return res.status(404).json({
+        success: false,
+        message: "Video not found",
+      });
+    }
+
+    // 2. Get user's watch history if logged in
+    let watchedVideoIds = [];
+    if (userId) {
+      const user = await User.findById(userId).select("watchHistory");
+      watchedVideoIds = user?.watchHistory.map((id) => id.toString()) || [];
+    }
+
+    // 3. Build query for related videos
+    const query = {
+      _id: { $ne: videoId },        // exclude current video
+      isPublished: true,
+      $or: [
+        { tags: { $in: video.tags } },
+        { category: video.category },
+        { owner: video.owner },
+      ],
+      _id: { $nin: watchedVideoIds }, // prioritize videos user hasn't watched
+    };
+
+    // 4. Fetch related videos
+    const relatedVideos = await Video.find(query)
+      .populate("owner", "username avatar")
+      .select("title thumbnail views createdAt duration")
+      .sort({ views: -1, createdAt: -1 }) // popular + recent
+      .skip((page - 1) * limit)
+      .limit(parseInt(limit));
+
+    const totalRelated = await Video.countDocuments(query);
+
+    return res.status(200).json({
+      success: true,
+      message: "Related videos fetched successfully",
+      pagination: {
+        total: totalRelated,
+        page: parseInt(page),
+        limit: parseInt(limit),
+        totalPages: Math.ceil(totalRelated / limit),
+      },
+      relatedVideos,
+    });
+  } catch (error) {
+    console.error("Error fetching related videos:", error);
+    return res.status(500).json({
+      success: false,
+      message: "Internal server error",
+      error: error.message,
+    });
+  }
+};
+
+
+
+
+
+
+
+const getWatchLaterVideos = async (req, res) => {
+  try {
+    const userId = req.user._id;
+    const page = parseInt(req.query.page) || 1;
+    const limit = parseInt(req.query.limit) || 10;
+
+    // 1. Fetch user's watchLater list
+    const user = await User.findById(userId).select("watchLater");
+    if (!user) {
+      return res.status(404).json({
+        success: false,
+        message: "User not found",
+      });
+    }
+
+    // 2. Filter only published videos
+    const videosQuery = Video.find({
+      _id: { $in: user.watchLater },
+      isPublished: true,
+    })
+      .populate("owner", "username avatar")
+      .select("title thumbnail views duration createdAt")
+      .sort({ createdAt: -1 }) // latest added first
+      .skip((page - 1) * limit)
+      .limit(limit);
+
+    const videos = await videosQuery.exec();
+
+    // 3. Total videos count
+    const totalVideos = await Video.countDocuments({
+      _id: { $in: user.watchLater },
+      isPublished: true,
+    });
+
+    // 4. Total duration calculation
+    const totalDuration = videos.reduce((acc, video) => acc + (video.duration || 0), 0);
+
+    return res.status(200).json({
+      success: true,
+      message: "Watch Later videos fetched successfully",
+      pagination: {
+        totalVideos,
+        page,
+        limit,
+        totalPages: Math.ceil(totalVideos / limit),
+      },
+      totalDuration,
+      videos,
+    });
+  } catch (error) {
+    console.error("Error fetching Watch Later videos:", error);
+    return res.status(500).json({
+      success: false,
+      message: "Internal server error",
+      error: error.message,
+    });
+  }
+};
+
+
+
+
+
+
+
+const reportVideo = async (req, res) => {
+  try {
+    const userId = req.user._id;
+    const { videoId } = req.params;
+    const { reason } = req.body;
+
+    if (!reason || reason.trim().length < 5) {
+      return res.status(400).json({
+        success: false,
+        message: "Please provide a valid reason (min 5 characters)",
+      });
+    }
+
+    // Check if video exists
+    const video = await Video.findById(videoId);
+    if (!video) {
+      return res.status(404).json({
+        success: false,
+        message: "Video not found",
+      });
+    }
+
+    // Check if already reported
+    const existingReport = await Report.findOne({
+      targetId: videoId,
+      reportedBy: userId,
+      type: "video",
+    });
+
+    if (existingReport) {
+      return res.status(400).json({
+        success: false,
+        message: "You have already reported this video",
+      });
+    }
+
+    // Create report
+    const report = await Report.create({
+      type: "video",
+      typeRef: "Video",
+      targetId: videoId,
+      reportedBy: userId,
+      reason,
+    });
+
+    return res.status(200).json({
+      success: true,
+      message: "Video reported successfully",
+      report,
+    });
+  } catch (error) {
+    console.error("Error reporting video:", error);
+    return res.status(500).json({
+      success: false,
+      message: "Internal server error",
+      error: error.message,
+    });
+  }
+};
+
+
+
+
+
 export { 
     uploadVideo ,
     getVideoById,
@@ -443,7 +781,12 @@ export {
     getVideosByUser,
     getTrendingVideos,
     incrementVideoViews ,
-    searchVideos
+    searchVideos,
+    toggleLikeOnVideo,
+    toggleDislikeOnVideo,
+    getRelatedVideos,
+    getWatchLaterVideos,
+    reportVideo
 };
 
 

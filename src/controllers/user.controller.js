@@ -5,9 +5,16 @@ import { uploadOnCloudinary } from "../utils/cloudinary.js";
 import { ApiResponse } from "../utils/ApiResponse.js";
 import jwt from "jsonwebtoken"
 import {Video} from "../models/video.model.js"
+import mongoose from "mongoose";
 import { handleVideoView } from "../services/view.service.js";
+import { Comments } from "../models/comments.modal.js";
+import { PlayList } from "../models/playList.model.js";
+import { subscription} from "../models/subscription.modal.js";
+
 // import { populate } from "dotenv";
 // import { View } from "../models/view.model.js";
+
+
 // Function to generate access and refresh tokens for a user
 const generateAccessAndRefreshToken = async (userId) => {
     try {
@@ -233,7 +240,6 @@ const getCurrentUser = asyncHandler(async(req,res)=>{
 
 const updateAccountDetails = asyncHandler(async(req,res)=>{
     const {fullName,email}=req.body
-console.log(req.body)
     if (!fullName || !email) {
         throw new ApiError(400,"All fields require")
     }
@@ -296,14 +302,13 @@ const updateUserAvatar = asyncHandler(async(req,res)=>{
 
 const updateUserCoverImage = asyncHandler(async(req,res)=>{
     const CoverImageLocalPath = req.file?.path
-   
+   console.log(CoverImageLocalPath)
     if (!CoverImageLocalPath) {
        throw new ApiError(400,"CoverImage file is missing");
        
     }
    
-    const CoverImage = await uploadOnCloudinary
-    (CoverImageLocalPath)
+    const CoverImage = await uploadOnCloudinary(CoverImageLocalPath)
      if (!CoverImage.url) {
        throw new ApiError(400, " Error while uploading on CoverImage")
      }
@@ -311,7 +316,7 @@ const updateUserCoverImage = asyncHandler(async(req,res)=>{
     const user= await User.findByIdAndUpdate(
        req.user?._id,{
            $set:{
-            CoverImage:CoverImage.url
+            coverImage:CoverImage.url
                }
        },
        {
@@ -319,6 +324,9 @@ const updateUserCoverImage = asyncHandler(async(req,res)=>{
            }
    
      ).select("-password")
+      if (!User) {
+        throw new ApiError(404, "User not found");
+    }
      return res
      .status(200)
      .json (new ApiResponse(200,user,"User CoverImage updated successfully",user)
@@ -391,6 +399,330 @@ const getWatchHistory = asyncHandler(async (req, res) => {
 
 
 
+
+const deleteAccount = async (req, res) => {
+    const session = await mongoose.startSession();
+    session.startTransaction();
+    try {
+        const userId = req.user._id;
+
+        // 1. Check if user exists
+        const user = await User.findById(userId).session(session);
+        if (!user) {
+            await session.abortTransaction();
+            session.endSession();
+            return res.status(404).json({
+                success: false,
+                message: "User not found"
+            });
+        }
+
+        // 2. Delete related data
+        await Video.deleteMany({ owner: userId }).session(session);
+        await Comments.deleteMany({ owner: userId }).session(session);
+        await PlayList.deleteMany({ owner: userId }).session(session);
+        await subscription.deleteMany({
+            $or: [{ subscriber: userId }, { channel: userId }]
+        }).session(session);
+
+        // 3. Delete user itself
+        await User.findByIdAndDelete(userId).session(session);
+
+        await session.commitTransaction();
+        session.endSession();
+
+        return res.status(200).json({
+            success: true,
+            message: "Account and related data deleted successfully"
+        });
+    } catch (error) {
+        await session.abortTransaction();
+        session.endSession();
+        console.error("Error deleting account:", error);
+        return res.status(500).json({
+            success: false,
+            message: "Internal server error",
+            error: error.message
+        });
+    }
+};
+
+
+
+
+const getUserChannel = async (req, res) => {
+    try {
+        const { userId } = req.params;
+        const { page = 1, limit = 10 } = req.query; // pagination support
+        const skip = (page - 1) * limit;
+
+        // 1. Get channel (User details without password)
+        const channel = await User.findById(userId)
+            .select("_id username email avatar coverImage createdAt");
+        if (!channel) {
+            return res.status(404).json({
+                success: false,
+                message: "Channel not found"
+            });
+        }
+
+        // 2. Subscribers & SubscribedTo count (aggregation for performance)
+        const [stats] = await Subscription.aggregate([
+            {
+                $facet: {
+                    subscribersCount: [
+                        { $match: { channel: channel._id } },
+                        { $count: "count" }
+                    ],
+                    subscribedToCount: [
+                        { $match: { subscriber: channel._id } },
+                        { $count: "count" }
+                    ]
+                }
+            }
+        ]);
+
+        const subscribersCount = stats.subscribersCount[0]?.count || 0;
+        const subscribedToCount = stats.subscribedToCount[0]?.count || 0;
+
+        // 3. Is current user subscribed?
+        let isSubscribed = false;
+        if (req.user) {
+            const sub = await Subscription.findOne({
+                subscriber: req.user._id,
+                channel: channel._id
+            });
+            isSubscribed = !!sub;
+        }
+
+        // 4. Videos (pagination + selective fields)
+        const videos = await Video.find({ owner: channel._id })
+            .select("_id title thumbnail views createdAt")
+            .sort({ createdAt: -1 })
+            .skip(skip)
+            .limit(parseInt(limit));
+
+        // 5. Total videos count (for frontend pagination)
+        const totalVideos = await Video.countDocuments({ owner: channel._id });
+
+        return res.status(200).json({
+            success: true,
+            channel: {
+                ...channel.toObject(),
+                subscribersCount,
+                subscribedToCount,
+                isSubscribed
+            },
+            videos,
+            pagination: {
+                totalVideos,
+                currentPage: parseInt(page),
+                totalPages: Math.ceil(totalVideos / limit)
+            }
+        });
+
+    } catch (error) {
+        console.error("Error fetching channel:", error);
+        return res.status(500).json({
+            success: false,
+            message: "Internal server error",
+            error: error.message
+        });
+    }
+};
+
+
+
+
+const getUserSubscribers = async (req, res) => {
+    try {
+        const { userId } = req.params; // जिस channel के subscribers चाहिए
+        const requesterId = req.user?._id?.toString(); // logged-in user id
+        const { page = 1, limit = 10 } = req.query;
+        const skip = (page - 1) * limit;
+
+        // 1. Channel existence check
+        const channel = await User.findById(userId).select("_id username avatar");
+        if (!channel) {
+            return res.status(404).json({
+                success: false,
+                message: "Channel not found"
+            });
+        }
+
+        // 2. Aggregation for count + subscribers
+        const pipeline = [
+            { $match: { channel: channel._id } },
+            {
+                $facet: {
+                    totalCount: [{ $count: "count" }],
+                    subscribers: [
+                        { $sort: { createdAt: -1 } },
+                        { $skip: skip },
+                        { $limit: parseInt(limit) },
+                        {
+                            $lookup: {
+                                from: "users",
+                                localField: "subscriber",
+                                foreignField: "_id",
+                                as: "subscriber"
+                            }
+                        },
+                        { $unwind: "$subscriber" },
+                        {
+                            $project: {
+                                _id: "$subscriber._id",
+                                username: "$subscriber.username",
+                                avatar: "$subscriber.avatar",
+                                subscribedAt: "$createdAt"
+                            }
+                        }
+                    ]
+                }
+            }
+        ];
+
+        const [result] = await Subscription.aggregate(pipeline);
+        const totalSubscribers = result.totalCount[0]?.count || 0;
+
+        // 3. If owner → return list + count (with pagination)
+        if (requesterId === userId.toString()) {
+            return res.status(200).json({
+                success: true,
+                channel: {
+                    _id: channel._id,
+                    username: channel.username,
+                    avatar: channel.avatar
+                },
+                totalSubscribers,
+                subscribers: result.subscribers,
+                pagination: {
+                    currentPage: parseInt(page),
+                    totalPages: Math.ceil(totalSubscribers / limit)
+                }
+            });
+        }
+
+        // 4. If other → only count
+        return res.status(200).json({
+            success: true,
+            channel: {
+                _id: channel._id,
+                username: channel.username,
+                avatar: channel.avatar
+            },
+            totalSubscribers
+        });
+
+    } catch (error) {
+        console.error("Error fetching subscribers:", error);
+        return res.status(500).json({
+            success: false,
+            message: "Internal server error",
+            error: error.message
+        });
+    }
+};
+
+
+
+
+
+
+const getSubscribedChannels = async (req, res) => {
+    try {
+        const { userId } = req.params; // जिस user के subscriptions देख रहे हैं
+        const requesterId = req.user?._id?.toString(); // logged-in user
+        const { page = 1, limit = 10 } = req.query;
+        const skip = (page - 1) * limit;
+
+        // 1. User existence check
+        const user = await User.findById(userId).select("_id username avatar");
+        if (!user) {
+            return res.status(404).json({
+                success: false,
+                message: "User not found"
+            });
+        }
+
+        // 2. Aggregate total count + channels list
+        const pipeline = [
+            { $match: { subscriber: user._id } },
+            {
+                $facet: {
+                    totalCount: [{ $count: "count" }],
+                    channels: [
+                        { $sort: { createdAt: -1 } },
+                        { $skip: skip },
+                        { $limit: parseInt(limit) },
+                        {
+                            $lookup: {
+                                from: "users",
+                                localField: "channel",
+                                foreignField: "_id",
+                                as: "channel"
+                            }
+                        },
+                        { $unwind: "$channel" },
+                        {
+                            $project: {
+                                _id: "$channel._id",
+                                username: "$channel.username",
+                                avatar: "$channel.avatar",
+                                subscribedAt: "$createdAt"
+                            }
+                        }
+                    ]
+                }
+            }
+        ];
+
+        const [result] = await Subscription.aggregate(pipeline);
+        const totalSubscribedChannels = result.totalCount[0]?.count || 0;
+
+        // 3. If owner → return full list + count
+        if (requesterId === userId.toString()) {
+            return res.status(200).json({
+                success: true,
+                user: {
+                    _id: user._id,
+                    username: user.username,
+                    avatar: user.avatar
+                },
+                totalSubscribedChannels,
+                channels: result.channels,
+                pagination: {
+                    currentPage: parseInt(page),
+                    totalPages: Math.ceil(totalSubscribedChannels / limit)
+                }
+            });
+        }
+
+        // 4. If other → return only count
+        return res.status(200).json({
+            success: true,
+            user: {
+                _id: user._id,
+                username: user.username,
+                avatar: user.avatar
+            },
+            totalSubscribedChannels
+        });
+
+    } catch (error) {
+        console.error("Error fetching subscribed channels:", error);
+        return res.status(500).json({
+            success: false,
+            message: "Internal server error",
+            error: error.message
+        });
+    }
+};
+
+
+
+
+
 export { 
 registerUser,
 loginUser,
@@ -402,6 +734,10 @@ updateAccountDetails,
 updateUserAvatar,
 updateUserCoverImage,
 addToWatchHistory,
-getWatchHistory
+getWatchHistory,
+deleteAccount,
+getUserChannel,
+getUserSubscribers,
+getSubscribedChannels
 };
 
